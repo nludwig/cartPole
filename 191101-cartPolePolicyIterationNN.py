@@ -203,7 +203,7 @@ def main(nInnerPolicy=1,widthPolicy=32,nInnerValue=1,widthValue=32,
         policyNet,valueNet,actArr,rewArr,obsArr,durArr= \
                 runEpisodeSet(env,nTestEpisodes,maxTestEpisodeLength,
                               policyNet,policyLossFn,valueNet,valueLossFn,sco,
-                              lossFn,train=False,render=render)
+                              train=False,render=render)
         print('{}\t{}\t{}\t{}'.format(n,durArr.mean(),durArr.min(),durArr.max()))
         print('{}\t{}\t{}\t{}'.format(n,durArr.mean(),durArr.min(),durArr.max()),file=err)
 
