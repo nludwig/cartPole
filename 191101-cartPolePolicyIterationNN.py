@@ -22,14 +22,15 @@ class Net(nn.Module):
         x=F.relu(self.fcIn(x))
         for i in range(self.nInner):
             x=F.relu(self.fcInner[i](x))
-        x=self.sm(self.fcOut(x))
+        x=self.fcOut(x)
+        #x=self.sm(self.fcOut(x))
         return x
 
     def forwardTrain(self, x):
         x=F.relu(self.d1d(self.fcIn(x)))
         for i in range(self.nInner):
             x=F.relu(self.d1d(self.fcInner[i](x)))
-        x=self.sm(self.d1d(self.fcOut(x)))
+        x=self.d1d(self.fcOut(x))
         return x
 
 class StochasticChooseOutput():
@@ -45,9 +46,6 @@ class StochasticChooseOutput():
         rand=self.rollUniform()
         a=bisect_left(q, rand)
         return a
-
-def lossFn(act, ret, i):
-    return -ret*torch.log(act[i])
 
 def compute1dIndex(index,shape):
     d=len(shape)
@@ -70,7 +68,8 @@ def runEpisode(env,sco,episode,nEpisodes,maxEpisodeLength,seed=None,render=False
         if render:
             env.render()
         ttobs=torch.tensor(obs)[None,:].float()
-        actP=sharedArgs['net'].forwardTrain(ttobs)[0]
+        actV=sharedArgs['net'].forwardTest(ttobs)
+        actP=sharedArgs['net'].sm(actV)[0]
         act=sco.actionFromProbabilities(actP)
         #actIndArr[episode,t]=act
         index=compute1dIndex((episode,t),sharedArgs['actIndShape'])
@@ -106,73 +105,85 @@ def loadSharedArgs(net,
     sharedArgs['dur']=durRaw
     sharedArgs['durShape']=durShape
 
-def runEpisodeSet(env,nEpisodes,maxEpisodeLength,net,sco,discountFactor=1.,train=True,render=True,learningRate=1e-2,rngSeed=None,nProcs=mp.cpu_count()//2):
+def runEpisodeSet(env,nEpisodes,maxEpisodeLength,net,sco,lossFn,discountFactor=1.,train=True,render=True,learningRate=1e-2,rngSeed=None,nProcs=mp.cpu_count()//2):
     err=sys.stderr
     rng=np.random.RandomState(seed=rngSeed)
-    #actIndArr=np.zeros((nEpisodes,maxEpisodeLength),dtype=np.int32)
-    #rewArr=np.zeros((nEpisodes,maxEpisodeLength),dtype=np.int32)
-    #obsArr=np.zeros((nEpisodes,maxEpisodeLength,4))
-    #durArr=np.ones(nEpisodes,dtype=np.int32)*maxEpisodeLength
 
+    #setup arrays for parallel trj runs
     actIndShape=(nEpisodes,maxEpisodeLength)
     actIndRaw=mp.RawArray('i',actIndShape[0]*actIndShape[1])
-    #np.copyto(actIndRaw,actIndArr)
     rewShape=(nEpisodes,maxEpisodeLength)
     rewRaw=mp.RawArray('i',rewShape[0]*rewShape[1])
-    #np.copyto(rewRaw,rewArr)
     obsShape=(nEpisodes,maxEpisodeLength,4)
     obsRaw=mp.RawArray('d',obsShape[0]*obsShape[1]*obsShape[2])
-    #np.copyto(obsRaw,obsArr)
     durShape=(nEpisodes,)
     durRaw=mp.RawArray('i',durShape[0])
-    #np.copyto(durRaw,durArr)
     initArgs=(net,
               actIndRaw,actIndShape,
               rewRaw,rewShape,
               obsRaw,obsShape,
               durRaw,durShape)
 
+    #launch parallel trj runs to get data
     pool=mp.Pool(nProcs,initializer=loadSharedArgs,initargs=initArgs)
     args=[(env,sco,episode,nEpisodes,maxEpisodeLength,
            rng.randint(np.iinfo(np.int32).max)) for episode in range(nEpisodes)]
     pool.starmap(runEpisode,args)
     pool.close()
     pool.join()
+
+    #load parallel trj data into np arrays
     actIndArr=np.frombuffer(actIndRaw,dtype=np.int32).reshape(actIndShape)
     rewArr=np.frombuffer(rewRaw,dtype=np.int32).reshape(rewShape)
     obsArr=np.frombuffer(obsRaw).reshape(obsShape)
     durArr=np.frombuffer(durRaw,dtype=np.int32).reshape(durShape)
-    if train is True: #wait till end to determine return
-        net.zero_grad() #...for each action
+
+    if train is True: #training can only happen after have trj return
+        optimizer=torch.optim.Adam(net.parameters(), lr=learningRate)
+        optimizer.zero_grad()
+        ret=[]
+        obs=[]
+        actInd=[]
         for episode in range(nEpisodes):
-            for t in range(durArr[episode]):
-                ret=rewArr[episode,t:durArr[episode]].sum()
-                ttobs=torch.tensor(obsArr[episode,t])[None,:].float()
-                act=net.forwardTest(ttobs)[0]
-                #act=net.forwardTrain(ttobs)[0]
-                loss=lossFn(act,ret,actIndArr[episode,t])/nEpisodes
-                print(episode,t,ret,act,loss.item(),file=err)
-                loss.backward() #accumulate grad
-        for p in net.parameters(): #update based on accumulated
-            p.data.sub_(learningRate*p.grad.data) #...gradients
+            ret+=[rewArr[episode,t:durArr[episode]].sum() for t in range(durArr[episode])]
+            obs+=list(obsArr[episode,:durArr[episode]])
+            actInd+=list(actIndArr[episode,:durArr[episode]])
+        ret=torch.tensor(ret)
+        obs=torch.tensor(obs).float()
+        actInd=torch.tensor(actInd).long()
+        actV=net.forwardTest(obs)
+        loss=lossFn(actV,actInd)*ret/nEpisodes
+        loss=loss.mean()
+        loss.backward()
+        optimizer.step()
     return net,actIndArr,rewArr,obsArr,durArr
 
-def main(nInner=2,width=100,nTrainingEpochs=100,nTrainingEpisodes=500,maxTrainingEpisodeLength=500,nTestEpochs=10,nTestEpisodes=1,maxTestEpisodeLength=500,discountFactor=1.0,envSeed=None,render=False,rngSeed=None):
+def main(nInner=1,width=32,nTrainingEpochs=100,nTrainingEpisodes=5000,maxTrainingEpisodeLength=500,nTestEpochs=10,nTestEpisodes=1,maxTestEpisodeLength=500,discountFactor=1.0,envSeed=None,render=False,rngSeed=None,fOutNmTemplate='cartPoleRewardDistribution'):
     err=sys.stderr
     env=gym.make('CartPole-v1')
     print(env.seed(envSeed),file=err)
     net=Net(nInner=nInner,width=width)
     sco=StochasticChooseOutput(seed=rngSeed)
+    lossFn=nn.CrossEntropyLoss(reduction='none')
+    print('nInner, width: {}, {}'.format(nInner,width),file=err)
     print('#ep\ttFmean\tmin\tmax')
 
     for n in range(0,nTrainingEpochs):
-        net,actArr,rewArr,obsArr,durArr=runEpisodeSet(env,nTrainingEpisodes,maxTrainingEpisodeLength,net,sco,train=True,render=render)
+        net,actArr,rewArr,obsArr,durArr=runEpisodeSet(env,nTrainingEpisodes,maxTrainingEpisodeLength,net,sco,lossFn,train=True,render=render)
+        #basic stats
         print('{}\t{}\t{}\t{}'.format(n,durArr.mean(),durArr.min(),durArr.max()))
         print('{}\t{}\t{}\t{}'.format(n,durArr.mean(),durArr.min(),durArr.max()),file=err)
+        ##distributions
+        #fOutNm=fOutNmTemplate+'Epoch{}.out'.format(n)
+        #with open(fOutNm,'w') as f:
+        #    durVals,durNums=np.unique(durArr,return_counts=True)
+        #    print('#dur/R\tnum\tP[dur/R]',file=f)
+        #    for i in range(len(durVals)):
+        #        print('{}\t{}\t{}'.format(durVals[i],durNums[i],durNums[i]/nTrainingEpisodes),file=f)
 
     print('test:')
     for n in range(0,nTestEpochs):
-        net,actArr,rewArr,obsArr,durArr=runEpisodeSet(env,nTrainingEpisodes,maxTrainingEpisodeLength,net,sco,train=False,render=render)
+        net,actArr,rewArr,obsArr,durArr=runEpisodeSet(env,nTrainingEpisodes,maxTrainingEpisodeLength,net,sco,lossFn,train=False,render=render)
         print('{}\t{}\t{}\t{}'.format(n,durArr.mean(),durArr.min(),durArr.max()))
         print('{}\t{}\t{}\t{}'.format(n,durArr.mean(),durArr.min(),durArr.max()),file=err)
 
